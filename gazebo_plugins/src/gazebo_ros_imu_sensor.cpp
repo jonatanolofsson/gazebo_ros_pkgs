@@ -116,6 +116,28 @@ void GazeboRosImuSensor::Load(gazebo::sensors::SensorPtr _sensor, sdf::ElementPt
     gazebo_ros::NoiseVariance(impl_->sensor_->Noise(SNT::IMU_LINACC_Y_NOISE_METERS_PER_S_SQR));
   msg->linear_acceleration_covariance[8] =
     gazebo_ros::NoiseVariance(impl_->sensor_->Noise(SNT::IMU_LINACC_Z_NOISE_METERS_PER_S_SQR));
+  if (_sdf->HasElement("orientation_covariance_x")) {
+    msg->orientation_covariance[0] = _sdf->Get<double>("orientation_covariance_x");
+    RCLCPP_INFO(
+      impl_->ros_node_->get_logger(),
+      "<orientation_covariance_x> set to %f", msg->orientation_covariance[0]);
+  } else {
+    RCLCPP_WARN(
+      impl_->ros_node_->get_logger(),
+      "Orientation covariance not set!");
+  }
+  if (_sdf->HasElement("orientation_covariance_y")) {
+    msg->orientation_covariance[4] = _sdf->Get<double>("orientation_covariance_y");
+    RCLCPP_INFO(
+      impl_->ros_node_->get_logger(),
+      "<orientation_covariance_y> set to %f", msg->orientation_covariance[4]);
+  }
+  if (_sdf->HasElement("orientation_covariance_z")) {
+    msg->orientation_covariance[8] = _sdf->Get<double>("orientation_covariance_z");
+    RCLCPP_INFO(
+      impl_->ros_node_->get_logger(),
+      "<orientation_covariance_z> set to %f", msg->orientation_covariance[8]);
+  }
 
   impl_->msg_ = msg;
 
