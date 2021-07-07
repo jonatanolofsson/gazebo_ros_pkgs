@@ -51,10 +51,12 @@
  */
 
 #include <gazebo/common/Time.hh>
+#include <gazebo/common/PID.hh>
 #include <gazebo/physics/Joint.hh>
 #include <gazebo/physics/Link.hh>
 #include <gazebo/physics/Model.hh>
 #include <gazebo/physics/World.hh>
+#include <gazebo/physics/JointController.hh>
 #include <gazebo_plugins/gazebo_ros_diff_drive.hpp>
 #include <gazebo_ros/conversions/builtin_interfaces.hpp>
 #include <gazebo_ros/conversions/geometry_msgs.hpp>
@@ -151,17 +153,14 @@ public:
   /// Distance between the wheels, in meters.
   std::vector<double> wheel_separation_;
 
-  /// Diameter of wheels, in meters.
-  std::vector<double> wheel_diameter_;
+  /// Radius of wheels, in meters.
+  std::vector<double> wheel_radius_;
 
   /// Maximum wheel torque, in Nm.
   double max_wheel_torque_;
 
-  /// Maximum wheel acceleration
-  double max_wheel_accel_;
-
-  /// Desired wheel speed.
-  std::vector<double> desired_wheel_speed_;
+  /// Maximum wheel velocity
+  double max_wheel_vel_;
 
   /// Speed sent to wheel.
   std::vector<double> wheel_speed_instr_;
@@ -221,7 +220,10 @@ public:
   unsigned int num_wheel_pairs_;
 
   /// Covariance in odometry
-  double covariance_[3];
+  double covariance_[6];
+
+  /// Joint controller
+  gazebo::physics::JointControllerPtr jointController_;
 };
 
 GazeboRosDiffDrive::GazeboRosDiffDrive()
@@ -254,8 +256,8 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
   }
 
   // Dynamic properties
-  impl_->max_wheel_accel_ = _sdf->Get<double>("max_wheel_acceleration", 0.0).first;
   impl_->max_wheel_torque_ = _sdf->Get<double>("max_wheel_torque", 5.0).first;
+  impl_->max_wheel_vel_ = _sdf->Get<double>("max_wheel_velocity", 1.0).first;
 
   // Get joints and Kinematic properties
   std::vector<gazebo::physics::JointPtr> left_joints, right_joints;
@@ -300,10 +302,40 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
     return;
   }
 
+  impl_->jointController_.reset(new gazebo::physics::JointController(impl_->model_));
+
   unsigned int index;
   for (index = 0; index < impl_->num_wheel_pairs_; ++index) {
     impl_->joints_.push_back(right_joints[index]);
     impl_->joints_.push_back(left_joints[index]);
+  }
+
+  index = 0;
+  auto pid_gains = _sdf->GetElement("pid_gains");
+  auto i_range = _sdf->GetElement("i_range");
+  while (pid_gains != nullptr && i_range != nullptr) {
+    if (index >= impl_->num_wheel_pairs_) {
+      RCLCPP_WARN(impl_->ros_node_->get_logger(), "Ignoring rest of specified <pid_gains> and <i_range>");
+      break;
+    }
+    impl_->jointController_->AddJoint(right_joints[index]);
+    impl_->jointController_->AddJoint(left_joints[index]);
+    auto pid = pid_gains->Get<ignition::math::Vector3d>();
+    auto i_range_vec = i_range->Get<ignition::math::Vector2d>();
+    impl_->jointController_->SetVelocityPID(
+        right_joints[index]->GetScopedName(),
+        gazebo::common::PID(
+          pid.X(), pid.Y(), pid.Z(), i_range_vec.Y(), i_range_vec.X()));
+    impl_->jointController_->SetVelocityPID(
+        left_joints[index]->GetScopedName(),
+        gazebo::common::PID(
+          pid.X(), pid.Y(), pid.Z(), i_range_vec.Y(), i_range_vec.X()));
+    RCLCPP_INFO(impl_->ros_node_->get_logger(),
+        "Axis %i pid: %f %f %f ; %f - %f",
+          index, pid.X(), pid.Y(), pid.Z(), i_range_vec.Y(), i_range_vec.X());
+    ++index;
+    pid_gains = pid_gains->GetNextElement("pid_gains");
+    i_range = i_range->GetNextElement("i_range");
   }
 
   index = 0;
@@ -323,7 +355,7 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
   }
 
   index = 0;
-  impl_->wheel_diameter_.assign(impl_->num_wheel_pairs_, 0.15);
+  impl_->wheel_radius_.assign(impl_->num_wheel_pairs_, 0.075);
   for (auto wheel_diameter = _sdf->GetElement("wheel_diameter"); wheel_diameter != nullptr;
     wheel_diameter = wheel_diameter->GetNextElement("wheel_diameter"))
   {
@@ -331,15 +363,14 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
       RCLCPP_WARN(impl_->ros_node_->get_logger(), "Ignoring rest of specified <wheel_diameter>");
       break;
     }
-    impl_->wheel_diameter_[index] = wheel_diameter->Get<double>();
+    impl_->wheel_radius_[index] = wheel_diameter->Get<double>() * 0.5;
     RCLCPP_INFO(
       impl_->ros_node_->get_logger(),
-      "Wheel pair %i diameter set to [%fm]", index + 1, impl_->wheel_diameter_[index]);
+      "Wheel pair %i radius set to [%fm]", index + 1, impl_->wheel_radius_[index]);
     index++;
   }
 
   impl_->wheel_speed_instr_.assign(2 * impl_->num_wheel_pairs_, 0);
-  impl_->desired_wheel_speed_.assign(2 * impl_->num_wheel_pairs_, 0);
 
   // Update rate
   auto update_rate = _sdf->Get<double>("update_rate", 100.0).first;
@@ -404,6 +435,9 @@ void GazeboRosDiffDrive::Load(gazebo::physics::ModelPtr _model, sdf::ElementPtr 
   impl_->covariance_[0] = _sdf->Get<double>("covariance_x", 0.00001).first;
   impl_->covariance_[1] = _sdf->Get<double>("covariance_y", 0.00001).first;
   impl_->covariance_[2] = _sdf->Get<double>("covariance_yaw", 0.001).first;
+  impl_->covariance_[3] = _sdf->Get<double>("covariance_vx", 0.00001).first;
+  impl_->covariance_[4] = _sdf->Get<double>("covariance_vy", 0.00001).first;
+  impl_->covariance_[5] = _sdf->Get<double>("covariance_vyaw", 0.001).first;
 
   // Listen to the update event (broadcast every simulation iteration)
   impl_->update_connection_ = gazebo::event::Events::ConnectWorldUpdateBegin(
@@ -484,52 +518,13 @@ void GazeboRosDiffDrivePrivate::OnUpdate(const gazebo::common::UpdateInfo & _inf
 #ifdef IGN_PROFILER_ENABLE
   IGN_PROFILE_END();
 #endif
-  // Current speed
-  std::vector<double> current_speed(2 * num_wheel_pairs_);
-  for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
-    current_speed[2 * i + LEFT] =
-      joints_[2 * i + LEFT]->GetVelocity(0) * (wheel_diameter_[i] / 2.0);
-    current_speed[2 * i + RIGHT] =
-      joints_[2 * i + RIGHT]->GetVelocity(0) * (wheel_diameter_[i] / 2.0);
-  }
-
-  // If max_accel == 0, or target speed is reached
-  for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
-    if (max_wheel_accel_ == 0 ||
-      ((fabs(desired_wheel_speed_[2 * i + LEFT] - current_speed[2 * i + LEFT]) < 0.01) &&
-      (fabs(desired_wheel_speed_[2 * i + RIGHT] - current_speed[2 * i + RIGHT]) < 0.01)))
-    {
-      joints_[2 * i + LEFT]->SetParam(
-        "vel", 0, desired_wheel_speed_[2 * i + LEFT] / (wheel_diameter_[i] / 2.0));
-      joints_[2 * i + RIGHT]->SetParam(
-        "vel", 0, desired_wheel_speed_[2 * i + RIGHT] / (wheel_diameter_[i] / 2.0));
-    } else {
-      if (desired_wheel_speed_[2 * i + LEFT] >= current_speed[2 * i + LEFT]) {
-        wheel_speed_instr_[2 * i + LEFT] += fmin(
-          desired_wheel_speed_[2 * i + LEFT] -
-          current_speed[2 * i + LEFT], max_wheel_accel_ * seconds_since_last_update);
-      } else {
-        wheel_speed_instr_[2 * i + LEFT] += fmax(
-          desired_wheel_speed_[2 * i + LEFT] -
-          current_speed[2 * i + LEFT], -max_wheel_accel_ * seconds_since_last_update);
-      }
-
-      if (desired_wheel_speed_[2 * i + RIGHT] > current_speed[2 * i + RIGHT]) {
-        wheel_speed_instr_[2 * i + RIGHT] += fmin(
-          desired_wheel_speed_[2 * i + RIGHT] -
-          current_speed[2 * i + RIGHT], max_wheel_accel_ * seconds_since_last_update);
-      } else {
-        wheel_speed_instr_[2 * i + RIGHT] += fmax(
-          desired_wheel_speed_[2 * i + RIGHT] -
-          current_speed[2 * i + RIGHT], -max_wheel_accel_ * seconds_since_last_update);
-      }
-
-      joints_[2 * i + LEFT]->SetParam(
-        "vel", 0, wheel_speed_instr_[2 * i + LEFT] / (wheel_diameter_[i] / 2.0));
-      joints_[2 * i + RIGHT]->SetParam(
-        "vel", 0, wheel_speed_instr_[2 * i + RIGHT] / (wheel_diameter_[i] / 2.0));
-    }
-  }
+  jointController_->Update();
+  RCLCPP_INFO(ros_node_->get_logger(), "Update joints: \n%f : %f / %f : %f",
+      jointController_->GetVelocities()[joints_[0]->GetScopedName()],
+      jointController_->GetVelocities()[joints_[1]->GetScopedName()],
+      joints_[0]->GetVelocity(0),
+      joints_[1]->GetVelocity(0)
+      );
 
   last_update_time_ = _info.simTime;
 }
@@ -538,12 +533,32 @@ void GazeboRosDiffDrivePrivate::UpdateWheelVelocities()
 {
   std::lock_guard<std::mutex> scoped_lock(lock_);
 
-  double vr = target_x_;
+  double vr = fmin(max_wheel_vel_, fmax(target_x_, -max_wheel_vel_));
   double va = target_rot_;
 
+  // Limit the angular velocity
   for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
-    desired_wheel_speed_[2 * i + LEFT] = vr - va * wheel_separation_[i] / 2.0;
-    desired_wheel_speed_[2 * i + RIGHT] = vr + va * wheel_separation_[i] / 2.0;
+    auto rotvel = va * wheel_separation_[i] / 2.0;
+    va = fmin(max_wheel_vel_, fmax(rotvel, -max_wheel_vel_)) * 2.0 / wheel_separation_[i];
+  }
+
+  // Limit the linear velocity
+  for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
+    auto rotvel = fabs(va * wheel_separation_[i] / 2.0);
+         if (vr + rotvel > max_wheel_vel_)  vr =  max_wheel_vel_ - rotvel;
+    else if (vr - rotvel > max_wheel_vel_)  vr =  max_wheel_vel_ + rotvel;
+    else if (vr - rotvel < -max_wheel_vel_) vr = -max_wheel_vel_ + rotvel;
+    else if (vr + rotvel < -max_wheel_vel_) vr = -max_wheel_vel_ - rotvel;
+  }
+
+  for (unsigned int i = 0; i < num_wheel_pairs_; ++i) {
+    auto rotvel = va * wheel_separation_[i] / 2.0;
+    auto left = (vr - rotvel) / wheel_radius_[i];
+    auto right = (vr + rotvel) / wheel_radius_[i];
+    //joints_[i * 2 + LEFT]->SetVelocity(0, left);
+    //joints_[i * 2 + RIGHT]->SetVelocity(0, right);
+    jointController_->SetVelocityTarget(joints_[i * 2 + LEFT]->GetScopedName(), left);
+    jointController_->SetVelocityTarget(joints_[i * 2 + RIGHT]->GetScopedName(), right);
   }
 }
 
@@ -565,8 +580,8 @@ void GazeboRosDiffDrivePrivate::UpdateOdometryEncoder(const gazebo::common::Time
   double b = wheel_separation_[0];
 
   // Book: Sigwart 2011 Autonompus Mobile Robots page:337
-  double sl = vl * (wheel_diameter_[0] / 2.0) * seconds_since_last_update;
-  double sr = vr * (wheel_diameter_[0] / 2.0) * seconds_since_last_update;
+  double sl = vl * wheel_radius_[0] * seconds_since_last_update;
+  double sr = vr * wheel_radius_[0] * seconds_since_last_update;
   double ssum = sl + sr;
 
   double sdiff = sr - sl;
@@ -656,12 +671,12 @@ void GazeboRosDiffDrivePrivate::PublishOdometryMsg(const gazebo::common::Time & 
   odom_.pose.covariance[28] = 1000000000000.0;
   odom_.pose.covariance[35] = covariance_[2];
 
-  odom_.twist.covariance[0] = covariance_[0];
-  odom_.twist.covariance[7] = covariance_[1];
+  odom_.twist.covariance[0] = covariance_[3];
+  odom_.twist.covariance[7] = covariance_[4];
   odom_.twist.covariance[14] = 1000000000000.0;
   odom_.twist.covariance[21] = 1000000000000.0;
   odom_.twist.covariance[28] = 1000000000000.0;
-  odom_.twist.covariance[35] = covariance_[2];
+  odom_.twist.covariance[35] = covariance_[5];
 
   // Set header
   odom_.header.frame_id = odometry_frame_;
