@@ -91,6 +91,27 @@ if(ENABLE_PROFILER)
   target_link_libraries(gazebo_ros_diff_drive ${ignition-common3_LIBRARIES})
 endif()
 
+# gazebo_ros_diff_drive2
+add_library(gazebo_ros_diff_drive2 SHARED
+  src/gazebo_ros_diff_drive2.cpp
+)
+target_include_directories(gazebo_ros_diff_drive2 PUBLIC include)
+ament_target_dependencies(gazebo_ros_diff_drive2
+  "gazebo_dev"
+  "gazebo_ros"
+  "geometry_msgs"
+  "nav_msgs"
+  "rclcpp"
+  "tf2"
+  "tf2_geometry_msgs"
+  "tf2_ros"
+)
+ament_export_libraries(gazebo_ros_diff_drive2)
+if(ENABLE_PROFILER)
+  target_include_directories(gazebo_ros_diff_drive2 PUBLIC ${ignition-common3_INCLUDE_DIRS})
+  target_link_libraries(gazebo_ros_diff_drive2 ${ignition-common3_LIBRARIES})
+endif()
+
 # gazebo_ros_force
 add_library(gazebo_ros_force SHARED
   src/gazebo_ros_force.cpp
@@ -501,6 +522,7 @@ install(TARGETS
     gazebo_ros_bumper
     gazebo_ros_camera
     gazebo_ros_diff_drive
+    gazebo_ros_diff_drive2
     gazebo_ros_elevator
     gazebo_ros_force
     gazebo_ros_ft_sensor
